@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Upload customer cluster snapshots or job failures through an OCI bucket PAR."""
+"""Upload cluster views, host maps, or job failures through an OCI bucket PAR."""
 
 import argparse
+import csv
 from datetime import datetime, timezone
 from http.client import HTTPException
 import json
@@ -9,6 +10,8 @@ from pathlib import Path
 import re
 import sys
 import subprocess
+import shutil
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -96,6 +99,9 @@ def validate_config(config):
 
 
 def validate_data(data, kind):
+    if kind == "cluster_map":
+        validate_cluster_map(data)
+        return
     if kind == "job_data":
         if "time" in data:
             timestamp(data["time"], "time")
@@ -150,8 +156,8 @@ def validate_data(data, kind):
     data[summary_key] = qualifying
 
 
-def discover_slurm(node_map=None):
-    """Build a cluster view from the controller reachable by the local scontrol."""
+def read_slurm_nodes():
+    """Query and validate the inventory from the locally configured controller."""
     try:
         result = subprocess.run(["scontrol", "--json", "show", "nodes"],
                                 capture_output=True, text=True, check=True, timeout=30)
@@ -171,6 +177,18 @@ def discover_slurm(node_map=None):
     nodes = response.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("Slurm returned no node inventory; refusing to create an empty cluster view")
+    names = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("Slurm returned an invalid node record")
+        names.append(node.get("name"))
+    string_list(names, "Slurm node names")
+    return nodes
+
+
+def discover_slurm(node_map=None):
+    """Build a cluster view from the controller reachable by the local scontrol."""
+    nodes = read_slurm_nodes()
     if node_map is not None and not isinstance(node_map, dict):
         raise ValueError("node map must be an object keyed by Slurm NodeName")
     data = {
@@ -240,6 +258,150 @@ def discover_slurm(node_map=None):
     return data
 
 
+def validate_cluster_map(data):
+    hosts = data.get("host_info")
+    if not isinstance(hosts, dict) or not hosts:
+        raise ValueError("host_info must be a nonempty object keyed by host name")
+    serials, ocids = set(), set()
+    for name, info in hosts.items():
+        nonempty_string(name, "host name")
+        if not isinstance(info, dict):
+            raise ValueError("each host_info entry must contain serial and ocid")
+        for key in ("serial", "ocid"):
+            nonempty_string(info.get(key), key)
+            if any(c.isspace() for c in info[key]) or "," in info[key]:
+                raise ValueError(f"{key} must not contain whitespace or commas")
+        if info["serial"] in serials or info["ocid"] in ocids:
+            raise ValueError("host serials and OCIDs must be unique within a cluster map")
+        serials.add(info["serial"])
+        ocids.add(info["ocid"])
+        if "rack_id" in info:
+            nonempty_string(info["rack_id"], "rack_id")
+
+
+def read_cluster_map(path):
+    if Path(path).suffix.lower() == ".csv":
+        data = {"host_info": {}}
+        try:
+            with Path(path).open(encoding="utf-8-sig", newline="") as source:
+                rows = csv.reader(source, strict=True, skipinitialspace=True)
+                header = next(rows, [])
+                if [value.strip().lower().replace(" ", "_") for value in header] != ["host_name", "host_serial", "host_ocid"]:
+                    raise ValueError("CSV header must be: host_name,host_serial,host_ocid")
+                for row in rows:
+                    if not row:
+                        continue
+                    if len(row) != 3:
+                        raise ValueError("each CSV row must contain host name, host serial, and host OCID")
+                    name, serial, ocid = (value.strip() for value in row)
+                    if name in data["host_info"]:
+                        raise ValueError("CSV contains a duplicate host name")
+                    data["host_info"][name] = {"serial": serial, "ocid": ocid}
+        except (OSError, UnicodeError, csv.Error):
+            raise ValueError("cannot read cluster map CSV; expected readable UTF-8 CSV") from None
+    else:
+        data = read_json(path)
+    validate_cluster_map(data)
+    return data
+
+
+def read_node_map(path):
+    data = read_cluster_map(path) if Path(path).suffix.lower() == ".csv" else read_json(path)
+    if "host_info" not in data:
+        return data  # Original node maps with host_serial remain supported.
+    validate_cluster_map(data)
+    return {name: {"host_serial": info["serial"],
+                   **({"rack_id": info["rack_id"]} if "rack_id" in info else {})}
+            for name, info in data["host_info"].items()}
+
+
+# The fixed command runs on each target, never on the collecting login node.
+HOST_INFO_COMMAND = (
+    "set -eu; "
+    "serial=$(sudo -n dmidecode -s system-serial-number); "
+    "ocid=$(curl -fsS --connect-timeout 5 --max-time 10 --noproxy 169.254.169.254 "
+    "-H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id); "
+    "printf 'BUCKET_MAP_SERIAL=%s\\nBUCKET_MAP_OCID=%s\\n' \"$serial\" \"$ocid\""
+)
+
+
+def parse_host_info(output):
+    lines = output.splitlines()
+    if len(lines) != 2 or not lines[0].startswith("BUCKET_MAP_SERIAL=") or not lines[1].startswith("BUCKET_MAP_OCID="):
+        raise ValueError("unexpected host command output")
+    info = {"serial": lines[0].split("=", 1)[1].strip(), "ocid": lines[1].split("=", 1)[1].strip()}
+    if not info["ocid"].startswith("ocid1.instance.") or not info["ocid"].split(".")[-1]:
+        raise ValueError("IMDS did not return an instance OCID")
+    if info["serial"].lower() in {"none", "unknown", "not specified", "to be filled by o.e.m."}:
+        raise ValueError("dmidecode did not return a usable serial")
+    validate_cluster_map({"host_info": {"host": info}})
+    return info
+
+
+def discover_cluster_map():
+    names = [node["name"] for node in read_slurm_nodes()]
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) for name in names):
+        raise ValueError("Slurm node names must be individual SSH host names (letters, digits, dots, underscores, dashes)")
+    hosts, failed = {}, []
+    clush = shutil.which("clush")
+    if clush:
+        print(f"Collecting {len(names)} hosts with clush (fanout 32)", file=sys.stderr)
+        with tempfile.TemporaryDirectory(prefix="bucket-map-") as directory:
+            folder = Path(directory)
+            hostfile = folder / "hosts"
+            hostfile.write_text("\n".join(names) + "\n")
+            outdir = folder / "stdout"
+            command = [clush, "--nostdin", "-S", "-R", "ssh", "-f", "32", "-t", "10", "-u", "30",
+                       "-o", "-oBatchMode=yes", f"--hostfile={hostfile}",
+                       f"--outdir={outdir}", f"--errdir={folder / 'stderr'}", HOST_INFO_COMMAND]
+            try:
+                result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                        text=True, timeout=((len(names) + 31) // 32) * 45 + 30)
+            except subprocess.TimeoutExpired:
+                raise ValueError("clush collection timed out; no cluster map was saved") from None
+            except (OSError, UnicodeError):
+                raise ValueError("could not execute clush; check the ClusterShell installation") from None
+            for name in names:
+                try:
+                    hosts[name] = parse_host_info((outdir / name).read_text())
+                except (OSError, UnicodeError, ValueError):
+                    failed.append(name)
+            if result.returncode and not failed:
+                raise ValueError("clush reported remote command failure; no cluster map was saved")
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise ValueError("cluster-map discovery requires clush or ssh")
+        print("clush unavailable; collecting hosts sequentially with SSH", file=sys.stderr)
+        for name in names:
+            try:
+                result = subprocess.run([ssh, "-n", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                         name, HOST_INFO_COMMAND], capture_output=True, text=True, check=True, timeout=40)
+                hosts[name] = parse_host_info(result.stdout)
+            except (OSError, UnicodeError, subprocess.SubprocessError, ValueError):
+                failed.append(name)
+    if failed:
+        raise ValueError("could not collect serial/OCID for: " + ", ".join(failed) +
+                         "; check SSH, noninteractive sudo for dmidecode, and IMDS access; no map saved")
+    data = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "host_info": hosts}
+    validate_cluster_map(data)
+    return data
+
+
+def write_cluster_map(path, data):
+    if Path(path).suffix.lower() not in {".json", ".csv"}:
+        raise ValueError("cluster map output path must end in .json or .csv")
+    validate_cluster_map(data)
+    with Path(path).open("x", encoding="utf-8", newline="") as output:
+        if Path(path).suffix.lower() == ".csv":
+            writer = csv.writer(output)
+            writer.writerow(["host_name", "host_serial", "host_ocid"])
+            writer.writerows((name, info["serial"], info["ocid"]) for name, info in data["host_info"].items())
+        else:
+            output.write(json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n")
+
+
 def prepare_upload(config, data, kind):
     validate_config(config)
     validate_data(data, kind)
@@ -253,7 +415,7 @@ def prepare_upload(config, data, kind):
     else:
         event_time = now
     data["timestamp"] = event_time.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    directory = "view" if kind == "cluster_view" else "job_data"
+    directory = "view" if kind == "cluster_view" else kind
     filename = event_time.strftime("%y%m%d:%H:%M:%S" if kind == "cluster_view"
                                    else "%y%m%d:%H:%M:%S.%f")
     object_name = f"{config['customer_id']}/{config['cluster_id']}/{directory}/{filename}.json"
@@ -294,20 +456,41 @@ def main(argv=None):
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("-cluster_view", "--cluster_view", metavar="JSON_FILE")
     modes.add_argument("-job_data", "--job_data", metavar="JSON_FILE")
+    modes.add_argument("-cluster_map", "--cluster_map", metavar="JSON_OR_CSV",
+                       help="upload a host name/serial/OCID map")
+    modes.add_argument("-discover_cluster_map", "--discover-cluster-map", metavar="JSON_OR_CSV",
+                       help="collect a Slurm cluster host map with clush (or SSH) and save locally")
     modes.add_argument("-discover_slurm", "--discover-slurm", metavar="JSON_FILE",
                        help="query Slurm and create a local cluster-view JSON file without uploading")
-    parser.add_argument("--node-map", metavar="JSON_FILE",
-                        help="optional Slurm node-name to host-serial/rack mapping for discovery")
+    parser.add_argument("--node-map", metavar="JSON_OR_CSV",
+                        help="cluster map (JSON/CSV) or original node-map JSON for Slurm discovery")
     parser.add_argument("--dry-run", action="store_true",
                         help="validate locally and print the object name without uploading")
     args = parser.parse_args(argv)
     if args.node_map and not args.discover_slurm:
         parser.error("--node-map requires --discover-slurm")
-    if args.discover_slurm and args.dry_run:
-        parser.error("--dry-run applies to uploads; --discover-slurm only creates a local file")
+    if (args.discover_slurm or args.discover_cluster_map) and args.dry_run:
+        parser.error("--dry-run applies to uploads; discovery only creates a local file")
+    if args.discover_cluster_map:
+        try:
+            if Path(args.discover_cluster_map).suffix.lower() not in {".json", ".csv"}:
+                raise ValueError("cluster map output path must end in .json or .csv")
+            if Path(args.discover_cluster_map).exists():
+                raise FileExistsError()
+            data = discover_cluster_map()
+            write_cluster_map(args.discover_cluster_map, data)
+            print(f"Created: {args.discover_cluster_map} ({len(data['host_info'])} hosts)")
+            return 0
+        except FileExistsError:
+            print("Error: output file already exists; choose a new path", file=sys.stderr)
+        except OSError:
+            print("Error: cannot write the cluster-map file", file=sys.stderr)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
     if args.discover_slurm:
         try:
-            node_map = read_json(args.node_map) if args.node_map else None
+            node_map = read_node_map(args.node_map) if args.node_map else None
             data = discover_slurm(node_map)
             body = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
             with Path(args.discover_slurm).open("x", encoding="utf-8") as output:
@@ -321,10 +504,10 @@ def main(argv=None):
         except ValueError as error:
             print(f"Error: {error}", file=sys.stderr)
         return 1
-    kind = "cluster_view" if args.cluster_view else "job_data"
+    kind = "cluster_view" if args.cluster_view else ("cluster_map" if args.cluster_map else "job_data")
     try:
         config = read_json(args.config)
-        data = read_json(getattr(args, kind))
+        data = read_cluster_map(args.cluster_map) if kind == "cluster_map" else read_json(getattr(args, kind))
         object_name, body = prepare_upload(config, data, kind)
         if not args.dry_run:
             upload(config["par_url"], object_name, body)

@@ -1,0 +1,12 @@
+{
+  "host_info": {
+    "node001": {
+      "serial": "HOST001",
+      "ocid": "ocid1.instance.oc1.example.unique001"
+    },
+    "node002": {
+      "serial": "HOST002",
+      "ocid": "ocid1.instance.oc1.example.unique002"
+    }
+  }
+}

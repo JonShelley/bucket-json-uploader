@@ -1,0 +1,3 @@
+host_name,host_serial,host_ocid
+node001,HOST001,ocid1.instance.oc1.example.unique001
+node002,HOST002,ocid1.instance.oc1.example.unique002

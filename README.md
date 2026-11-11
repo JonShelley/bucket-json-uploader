@@ -2,7 +2,7 @@
 
 MVP bucket uploader. Currently supports OCI Object Storage buckets only.
 
-Upload customer cluster snapshots and individual job failure events to OCI Object
+Upload customer cluster snapshots, host identity maps, and job failure events to OCI Object
 Storage through a write-only bucket pre-authenticated request (PAR). Requires
 Python 3.9 or later; no packages, OCI SDK, CLI, or customer API keys are needed.
 
@@ -33,9 +33,96 @@ python3 upload.py --config customer-a.json -job_data failure.json
 python3 upload.py --config config.example.json -cluster_view examples/cluster_view.json --dry-run
 ```
 
-`-config` is also accepted. Exactly one of `-cluster_view FILE` or `-job_data FILE`
-is required for uploads. Each upload command sends one JSON object. For multiple job failures, run
-one command per event. `--cluster_view` and `--job_data` also work.
+`-config` is also accepted. Upload modes are `-cluster_view FILE`, `-job_data FILE`,
+and `-cluster_map FILE`; choose exactly one. Each upload sends one JSON object.
+For multiple job failures, run one command per event. Double-dash spellings such
+as `--cluster_map` also work.
+
+## Upload or collect a cluster map
+
+A cluster map links host names to hardware serials and OCI instance OCIDs.
+Upload it as either UTF-8 JSON or CSV:
+
+```bash
+python3 upload.py --config config.json -cluster_map cluster-map.json
+python3 upload.py --config config.json -cluster_map cluster-map.csv
+```
+
+Both formats are uploaded as JSON under
+`<customer>/<cluster>/cluster_map/YYMMDD:HH:MM:SS.ffffff.json`, with the usual
+customer/cluster envelope and `data_type: "cluster_map"`. JSON accepts an optional
+UTC `timestamp`; if absent, the uploader adds one. CSV has exactly three columns,
+so its upload timestamp is generated when uploading.
+
+JSON format (`examples/cluster_map.json`):
+
+```json
+{
+  "host_info": {
+    "node001": {"serial": "HOST001", "ocid": "ocid1.instance.oc1.example.unique001"},
+    "node002": {"serial": "HOST002", "ocid": "ocid1.instance.oc1.example.unique002"}
+  }
+}
+```
+
+CSV format (`examples/cluster_map.csv`), including the required header:
+
+```csv
+host_name,host_serial,host_ocid
+node001,HOST001,ocid1.instance.oc1.example.unique001
+node002,HOST002,ocid1.instance.oc1.example.unique002
+```
+
+The header also accepts spaces, such as `host name,host serial,host ocid`, and
+ignores capitalization. Every entry must provide all three values. Duplicate
+host names, serials, or OCIDs are rejected. JSON may additionally include a
+`rack_id` inside each host entry for use with Slurm view discovery.
+
+To collect the map automatically from the Slurm cluster:
+
+```bash
+# Create JSON (includes the UTC collection timestamp)
+python3 upload.py --discover-cluster-map cluster-map.json
+
+# Or create the same map as three-column CSV
+python3 upload.py --discover-cluster-map cluster-map.csv
+
+# Use the collected map when generating a cluster view
+python3 upload.py --discover-slurm cluster-view.json --node-map cluster-map.json
+```
+
+`-discover_cluster_map` is an alias. Collection requires no bucket config and
+does not upload automatically. The script obtains node names from
+`scontrol --json show nodes`, then runs these queries on every node:
+
+```bash
+sudo -n dmidecode -s system-serial-number
+curl -fsS --connect-timeout 5 --max-time 10 --noproxy 169.254.169.254 \
+  -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id
+```
+
+The IMDS value is the **instance OCID**, not a physical host OCID. Serial and
+OCID results are tied to the Slurm NodeName used to address that node. NodeNames
+must therefore be resolvable SSH destinations from the collecting machine.
+Rack IDs are not discovered by these two commands and can be added to JSON later.
+
+When `clush` is on PATH, collection uses it with fanout 32, a host file, separate
+per-host output files, a 10-second connection timeout, a 30-second remote command
+timeout, and remote exit-code checking. This requires ClusterShell support for
+`--hostfile`, `--outdir`, and `--errdir`. Without `clush`, the script reports that
+it is falling back to sequential SSH, with a 40-second timeout per host. Both
+paths use noninteractive SSH; existing SSH configuration and host-key checks apply.
+
+Each node needs `curl`, `dmidecode`, IMDS access, and sudo rights that allow
+`sudo -n dmidecode -s system-serial-number` without a password prompt. The `-n`
+option ensures a missing permission fails rather than hanging collection.
+Collection includes all nodes returned by Slurm, including down/FUTURE nodes;
+unreachable hosts will fail collection. Failed or malformed responses are
+reported by host name, and no partial map is saved. Existing output files are
+never overwritten. Correct access/connectivity and rerun with a fresh path.
+
+See [ClusterShell output collection](https://clustershell.readthedocs.io/en/stable/tools/clush.html#saving-output-in-files)
+and [OCI instance metadata](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/gettingmetadata.htm).
 
 ## Discover a cluster from Slurm
 
@@ -85,7 +172,9 @@ the snapshot uses NodeName in both node fields, sets `node_identifier` to
 `slurm_node_name`, and omits `racks`. This is the discovery-specific exception to
 the host-serial convention used for manually prepared input.
 
-To use actual serials, supply a JSON object keyed by each exact Slurm NodeName:
+To use actual serials, pass a JSON/CSV cluster map with `--node-map`. The
+original node-map format below also remains supported, with entries keyed by
+each exact Slurm NodeName:
 
 ```json
 {
@@ -110,7 +199,7 @@ and [Slurm node states](https://slurm.schedmd.com/sinfo.html#SECTION_NODE-STATE-
 
 See the complete files in `examples/`.
 
-Both modes accept an optional `timestamp` field in the customer JSON, such as
+All upload modes accept an optional `timestamp` field in the customer JSON, such as
 `"timestamp": "2026-11-11T14:52:00.123456Z"`. It must be an ISO 8601 timestamp
 with a timezone. The uploader normalizes it to UTC and uses it for the object
 filename. Supply microseconds for job failures that occur within the same second.
@@ -185,7 +274,7 @@ Job failure fields:
 | `reason` | Nonempty string describing the failure |
 | `job_id` | Optional job identifier |
 
-Additional JSON fields are preserved inside `data`. Inputs must be UTF-8 JSON
+Additional JSON fields are preserved inside `data`. CSV cluster maps are normalized to `host_info` first. Inputs must be UTF-8 JSON
 objects; duplicate keys, NaN, and Infinity are rejected. JSON files are read into
 memory, making this suitable for small snapshots and events.
 
@@ -197,10 +286,11 @@ Object Storage directories are object-name prefixes:
 customer-a/cluster-01/
   view/261111:15:00:00.json
   job_data/261111:14:52:00.123456.json
+  cluster_map/261111:15:00:00.123456.json
 ```
 
-The hierarchy is customer → cluster → `view` or `job_data`, with no extra date
-directories. View filenames use `YYMMDD:HH:MM:SS.json`; job filenames use
+The hierarchy is customer → cluster → `view`, `job_data`, or `cluster_map`, with no extra date
+directories. View filenames use `YYMMDD:HH:MM:SS.json`; job and map filenames use
 `YYMMDD:HH:MM:SS.ffffff.json`, where `ffffff` is the six-digit microsecond
 fraction of the second. Both use the selected timestamp in UTC. The command
 option and envelope `data_type` remain `cluster_view` for views.
@@ -281,3 +371,6 @@ microsecond names, collision errors, validation, command modes and defaults,
 PUT construction, redirect refusal, and secret-free upload errors. Network calls
 are mocked; a live OCI upload requires an actual PAR. Slurm tests use synthetic
 controller responses; run discovery on your cluster to verify its client setup.
+Cluster-map tests cover CSV/JSON conversion, clush per-host output, SSH fallback,
+remote command execution with synthetic sudo/curl programs, and failure handling.
+They do not contact a live cluster or IMDS endpoint.
