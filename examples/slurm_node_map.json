@@ -1,0 +1,4 @@
+{
+  "node001": {"host_serial": "HOST001", "rack_id": "rack-01"},
+  "node002": {"host_serial": "HOST002", "rack_id": "rack-01"}
+}

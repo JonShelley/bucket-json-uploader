@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import subprocess
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -149,6 +150,96 @@ def validate_data(data, kind):
     data[summary_key] = qualifying
 
 
+def discover_slurm(node_map=None):
+    """Build a cluster view from the controller reachable by the local scontrol."""
+    try:
+        result = subprocess.run(["scontrol", "--json", "show", "nodes"],
+                                capture_output=True, text=True, check=True, timeout=30)
+    except FileNotFoundError:
+        raise ValueError("scontrol was not found; run discovery on a Slurm client or load its Slurm module") from None
+    except subprocess.TimeoutExpired:
+        raise ValueError("Slurm discovery timed out after 30 seconds; check controller connectivity") from None
+    except (subprocess.CalledProcessError, OSError, UnicodeError):
+        raise ValueError("Slurm discovery failed; verify that 'scontrol --json show nodes' works for this user") from None
+    try:
+        response = json.loads(result.stdout, parse_constant=reject_constant,
+                              object_pairs_hook=unique_keys)
+    except ValueError:
+        raise ValueError("scontrol returned invalid JSON; Slurm JSON output support is required") from None
+    if not isinstance(response, dict) or response.get("errors"):
+        raise ValueError("Slurm returned an error response; run 'scontrol --json show nodes' to diagnose")
+    nodes = response.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("Slurm returned no node inventory; refusing to create an empty cluster view")
+    if node_map is not None and not isinstance(node_map, dict):
+        raise ValueError("node map must be an object keyed by Slurm NodeName")
+    data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "source": "slurm",
+        "node_identifier": "host_serial" if node_map is not None else "slurm_node_name",
+        "total_nodes": len(nodes), "offline_nodes": 0,
+        "healthy_nodes": [], "unhealthy_nodes": {},
+    }
+    healthy_states = {"IDLE", "ALLOCATED", "MIXED", "COMPLETING"}
+    healthy_flags = {"RESERVED", "PLANNED", "CLOUD", "DYNAMIC_NORM"}
+    offline_states = {"DOWN", "UNKNOWN", "FUTURE", "NOT_RESPONDING", "POWERED_DOWN",
+                      "POWERING_DOWN", "POWERING_UP", "REBOOT_ISSUED"}
+    names, identifiers, racks = set(), set(), {}
+    rack_nodes = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("Slurm returned an invalid node record")
+        name = node.get("name")
+        nonempty_string(name, "Slurm node name")
+        if name in names:
+            raise ValueError("Slurm returned duplicate node names")
+        names.add(name)
+        states = node.get("state")
+        if isinstance(states, str):
+            states = states.split("+")
+        string_list(states, "Slurm node state")
+        if not states:
+            raise ValueError("Slurm returned a node without a state")
+        flags = {state.strip().upper() for state in states}
+        reason = node.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("Slurm returned an invalid node reason")
+        identifier, rack_id = name, None
+        if node_map is not None:
+            entry = node_map.get(name)
+            if not isinstance(entry, dict):
+                raise ValueError(f"node map is missing an entry for {name}")
+            identifier = entry.get("host_serial")
+            nonempty_string(identifier, f"host_serial for {name}")
+            if "rack_id" in entry:
+                rack_id = entry["rack_id"]
+                nonempty_string(rack_id, f"rack_id for {name}")
+        if identifier in identifiers or "," in identifier or identifier != identifier.strip():
+            raise ValueError("node identifiers must be unique, without commas or surrounding whitespace")
+        identifiers.add(identifier)
+        healthy = bool(flags & healthy_states) and flags <= healthy_states | healthy_flags
+        data["offline_nodes"] += bool(flags & offline_states)
+        if healthy:
+            data["healthy_nodes"].append(identifier)
+        else:
+            state_reason = "Slurm state: " + "+".join(sorted(flags))
+            data["unhealthy_nodes"][identifier] = (f"{reason.strip()} ({state_reason})"
+                                                   if reason and reason.strip() else state_reason)
+        if rack_id is not None:
+            rack_nodes += 1
+            rack = racks.setdefault(rack_id, {"total_nodes": 0, "healthy": 0, "unhealthy": ""})
+            rack["total_nodes"] += 1
+            rack["healthy"] += healthy
+            if not healthy:
+                rack["unhealthy"] += ("," if rack["unhealthy"] else "") + identifier
+    if racks:
+        if rack_nodes != len(nodes):
+            raise ValueError("provide rack_id for every discovered node or omit rack_id from all entries")
+        data["racks"] = racks
+    validate_data(data, "cluster_view")
+    return data
+
+
 def prepare_upload(config, data, kind):
     validate_config(config)
     validate_data(data, kind)
@@ -199,13 +290,37 @@ def upload(par_url, object_name, body):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("-config", "--config", default="config.json",
-                        help="config JSON path (default: ./config.json)")
+                        help="upload config JSON path (default: ./config.json)")
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("-cluster_view", "--cluster_view", metavar="JSON_FILE")
     modes.add_argument("-job_data", "--job_data", metavar="JSON_FILE")
+    modes.add_argument("-discover_slurm", "--discover-slurm", metavar="JSON_FILE",
+                       help="query Slurm and create a local cluster-view JSON file without uploading")
+    parser.add_argument("--node-map", metavar="JSON_FILE",
+                        help="optional Slurm node-name to host-serial/rack mapping for discovery")
     parser.add_argument("--dry-run", action="store_true",
                         help="validate locally and print the object name without uploading")
     args = parser.parse_args(argv)
+    if args.node_map and not args.discover_slurm:
+        parser.error("--node-map requires --discover-slurm")
+    if args.discover_slurm and args.dry_run:
+        parser.error("--dry-run applies to uploads; --discover-slurm only creates a local file")
+    if args.discover_slurm:
+        try:
+            node_map = read_json(args.node_map) if args.node_map else None
+            data = discover_slurm(node_map)
+            body = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+            with Path(args.discover_slurm).open("x", encoding="utf-8") as output:
+                output.write(body)
+            print(f"Created: {args.discover_slurm} ({data['total_nodes']} Slurm nodes; identifiers: {data['node_identifier']})")
+            return 0
+        except FileExistsError:
+            print("Error: output file already exists; choose a new path", file=sys.stderr)
+        except OSError:
+            print("Error: cannot write the cluster-view JSON file", file=sys.stderr)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
     kind = "cluster_view" if args.cluster_view else "job_data"
     try:
         config = read_json(args.config)

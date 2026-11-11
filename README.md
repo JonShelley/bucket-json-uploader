@@ -34,8 +34,77 @@ python3 upload.py --config config.example.json -cluster_view examples/cluster_vi
 ```
 
 `-config` is also accepted. Exactly one of `-cluster_view FILE` or `-job_data FILE`
-is required. Each command sends one JSON object. For multiple job failures, run
+is required for uploads. Each upload command sends one JSON object. For multiple job failures, run
 one command per event. `--cluster_view` and `--job_data` also work.
+
+## Discover a cluster from Slurm
+
+Run on a login or compute node where `scontrol --json show nodes` can reach the
+cluster controller. The Slurm client must support JSON output and have its data
+parser plugins installed. No extra Python packages or root access are needed.
+
+```bash
+# Generate a local cluster view; no PAR or config is needed
+python3 upload.py --discover-slurm cluster-view.json
+
+# Generate using hardware serials and optional rack IDs
+python3 upload.py --discover-slurm cluster-view.json --node-map examples/slurm_node_map.json
+
+# Upload the generated file with your customer/cluster config
+python3 upload.py --config config.json -cluster_view cluster-view.json
+```
+
+Use a new output path for each discovery run: an existing file is never
+overwritten. `-discover_slurm` is also accepted. Discovery and upload are separate
+commands, so the generated file can be reviewed or enriched before it is sent.
+`--dry-run` applies to uploads only. Failure to query or parse Slurm returns exit
+code 1 and does not create a snapshot. A query has a 30-second timeout.
+
+Discovery queries the controller once and uses all returned node records,
+including configured FUTURE nodes. Visibility depends on the Slurm permissions
+of the invoking user. It does not restrict the view to the current job allocation.
+Make sure the Slurm client targets the cluster named in the upload config.
+
+The snapshot includes the current UTC `timestamp`, node counts, healthy nodes,
+and unhealthy nodes with the Slurm reason and state. `source` is `slurm`.
+Classification is a scheduler-health snapshot, not a hardware or RDMA health
+check:
+
+| Classification | Policy |
+| --- | --- |
+| Healthy | IDLE, ALLOCATED, MIXED, or COMPLETING, optionally with RESERVED, PLANNED, CLOUD, or DYNAMIC_NORM flags |
+| Unhealthy | Every other state/flag combination, including DRAIN, FAIL, maintenance, reboot pending, and unrecognized flags |
+| Offline | Any DOWN, UNKNOWN, FUTURE, NOT_RESPONDING, POWERED_DOWN, POWERING_DOWN, POWERING_UP, or REBOOT_ISSUED flag |
+
+Offline nodes are a subset of unhealthy nodes. A drained node may still be
+running jobs and is not automatically counted as offline. Powered-down capacity
+may be intentional; the reason/state remains available for interpretation.
+
+Slurm NodeName is not necessarily a hardware serial number. Without a node map,
+the snapshot uses NodeName in both node fields, sets `node_identifier` to
+`slurm_node_name`, and omits `racks`. This is the discovery-specific exception to
+the host-serial convention used for manually prepared input.
+
+To use actual serials, supply a JSON object keyed by each exact Slurm NodeName:
+
+```json
+{
+  "node001": {"host_serial": "HOST001", "rack_id": "rack-01"},
+  "node002": {"host_serial": "HOST002", "rack_id": "rack-01"}
+}
+```
+
+The map must cover every discovered node with a unique `host_serial`. When used,
+`node_identifier` becomes `host_serial`. Include `rack_id` for all nodes to
+generate rack totals, healthy counts, comma-separated unhealthy serials, and
+`racks_with_16_plus_healthy_cts`. Omit `rack_id` from every entry for clusters
+without rack grouping. Partial serial or rack mappings are rejected so the
+snapshot cannot silently mix identities or undercount racks. Additional map
+entries for nodes not returned by Slurm are ignored. Rack IDs are supplied by
+the customer; network switches and hostname prefixes are not assumed to be racks.
+
+See the official [scontrol JSON output documentation](https://slurm.schedmd.com/scontrol.html#OPT_json)
+and [Slurm node states](https://slurm.schedmd.com/sinfo.html#SECTION_NODE-STATE-CODES).
 
 ## Input JSON
 
@@ -210,4 +279,5 @@ python3 -m unittest -v
 Tests cover routing and envelopes, UTC conversion and timestamp fallback,
 microsecond names, collision errors, validation, command modes and defaults,
 PUT construction, redirect refusal, and secret-free upload errors. Network calls
-are mocked; a live OCI upload requires an actual PAR.
+are mocked; a live OCI upload requires an actual PAR. Slurm tests use synthetic
+controller responses; run discovery on your cluster to verify its client setup.
