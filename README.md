@@ -1,4 +1,6 @@
-# OCI JSON uploader MVP
+# bucket-json-uploader
+
+MVP bucket uploader. Currently supports OCI Object Storage buckets only.
 
 Upload customer cluster snapshots and individual job failure events to OCI Object
 Storage through a write-only bucket pre-authenticated request (PAR). Requires
