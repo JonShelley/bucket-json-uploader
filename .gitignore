@@ -1,0 +1,7 @@
+config.json
+config.*.json
+!config.example.json
+__pycache__/
+sce-upload-verification.json
+examples/sce_cluster_view_test.json
+.DS_Store

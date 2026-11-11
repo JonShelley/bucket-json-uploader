@@ -1,0 +1,6 @@
+{
+  "timestamp": "2026-11-11T14:52:00.123456Z",
+  "job_id": "job-12345",
+  "host_serials": ["HOST003", "HOST004"],
+  "reason": "Job failed after an RDMA transport timeout"
+}

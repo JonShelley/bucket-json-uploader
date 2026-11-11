@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-11-11T15:00:00Z",
+  "total_nodes": 4,
+  "offline_nodes": 1,
+  "racks": [
+    {"rack_id": "rack-01", "healthy_cts": 16},
+    {"rack_id": "rack-02", "healthy_cts": 12}
+  ],
+  "healthy_nodes": ["HOST001", "HOST002"],
+  "unhealthy_nodes": ["HOST003", "HOST004"]
+}

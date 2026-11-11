@@ -1,0 +1,5 @@
+{
+  "customer_id": "customer-a",
+  "cluster_id": "cluster-01",
+  "par_url": "https://objectstorage.us-phoenix-1.oraclecloud.com/p/REPLACE_WITH_PAR_TOKEN/n/YOUR_NAMESPACE/b/YOUR_BUCKET/o/"
+}
