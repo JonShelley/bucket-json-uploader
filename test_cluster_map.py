@@ -103,7 +103,7 @@ class ClusterMapTests(unittest.TestCase):
         self.assertEqual(data["host_info"]["node001"]["serial"], "SERIAL0")
         self.assertTrue(data["timestamp"].endswith("Z"))
 
-    def test_clush_failures_do_not_create_partial_map(self):
+    def test_clush_failures_save_all_hosts_with_na(self):
         for outcome in (subprocess.CompletedProcess([], 1), subprocess.TimeoutExpired("clush", 30)):
             with self.subTest(outcome=type(outcome).__name__), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "map.json"
@@ -111,8 +111,11 @@ class ClusterMapTests(unittest.TestCase):
                         patch.object(upload.shutil, "which", return_value="/fake/clush"), \
                         patch.object(upload.subprocess, "run", side_effect=outcome if isinstance(outcome, Exception) else None,
                                      return_value=outcome), redirect_stderr(StringIO()):
-                    self.assertEqual(upload.main(["--discover-cluster-map", str(path)]), 1)
-                self.assertFalse(path.exists())
+                    self.assertEqual(upload.main(["--discover-cluster-map", str(path)]), 0)
+                self.assertEqual(upload.read_cluster_map(path)["host_info"], {
+                    "node001": {"serial": "N/A", "ocid": "N/A"},
+                    "node002": {"serial": "N/A", "ocid": "N/A"},
+                })
 
     def test_ssh_fallback_and_failed_host_reporting(self):
         responses = [subprocess.CompletedProcess([], 0, host_output("S1", "ocid1.instance.x.one")),
@@ -126,11 +129,13 @@ class ClusterMapTests(unittest.TestCase):
         responses[1] = subprocess.CalledProcessError(1, "ssh")
         with patch.object(upload, "read_slurm_nodes", return_value=self.nodes), \
                 patch.object(upload.shutil, "which", side_effect=lambda name: None if name == "clush" else "/fake/ssh"), \
-                patch.object(upload.subprocess, "run", side_effect=responses), redirect_stderr(StringIO()), \
-                self.assertRaisesRegex(ValueError, "node002"):
-            upload.discover_cluster_map()
+                patch.object(upload.subprocess, "run", side_effect=responses), redirect_stderr(StringIO()) as warnings:
+            data = upload.discover_cluster_map()
+        self.assertEqual(data["host_info"]["node001"]["serial"], "S1")
+        self.assertEqual(data["host_info"]["node002"], {"serial": "N/A", "ocid": "N/A"})
+        self.assertIn("node002", warnings.getvalue())
 
-    def test_remote_command_runs_requested_queries_and_stops_on_sudo_failure(self):
+    def test_remote_queries_preserve_the_successful_field(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             (folder / "sudo").write_text('#!/bin/sh\n[ "$*" = "-n dmidecode -s system-serial-number" ] || exit 99\nprintf SERIAL123\n')
@@ -148,19 +153,100 @@ class ClusterMapTests(unittest.TestCase):
             capture.unlink()
             (folder / "sudo").write_text('#!/bin/sh\nexit 1\n')
             result = subprocess.run(["/bin/sh", "-c", upload.HOST_INFO_COMMAND], env=env, capture_output=True, text=True, timeout=5)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(capture.exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(upload.parse_host_info(result.stdout),
+                             {"serial": "N/A", "ocid": "ocid1.instance.oc1.test.unique"})
+            self.assertTrue(capture.exists())
+            (folder / "sudo").write_text('#!/bin/sh\nprintf SERIAL123\n')
+            (folder / "curl").write_text('#!/bin/sh\nexit 22\n')
+            result = subprocess.run(["/bin/sh", "-c", upload.HOST_INFO_COMMAND], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(upload.parse_host_info(result.stdout), {"serial": "SERIAL123", "ocid": "N/A"})
 
-    def test_untrusted_output_and_invalid_targets_fail(self):
-        for output in ("", host_output(""), host_output("Not Specified"), host_output(ocid="<html>error</html>"),
-                       host_output() + "extra\n", host_output("A\nB")):
-            with self.subTest(output=output), self.assertRaises(ValueError):
-                upload.parse_host_info(output)
+    def test_invalid_or_missing_output_uses_na_per_field(self):
+        cases = [
+            ("", {"serial": "N/A", "ocid": "N/A"}),
+            (host_output(""), {"serial": "N/A", "ocid": "ocid1.instance.oc1.test.unique1"}),
+            (host_output("Not Specified"), {"serial": "N/A", "ocid": "ocid1.instance.oc1.test.unique1"}),
+            (host_output(ocid="<html>error</html>"), {"serial": "SERIAL1", "ocid": "N/A"}),
+            (host_output() + "extra\n", {"serial": "SERIAL1", "ocid": "N/A"}),
+            (host_output("A\nB"), {"serial": "N/A", "ocid": "ocid1.instance.oc1.test.unique1"}),
+            (b"BUCKET_MAP_SERIAL=SERIAL1\n", {"serial": "SERIAL1", "ocid": "N/A"}),
+            ("BUCKET_MAP_SERIAL=A\nBUCKET_MAP_SERIAL=B\n", {"serial": "N/A", "ocid": "N/A"}),
+        ]
+        for output, expected in cases:
+            with self.subTest(output=output):
+                self.assertEqual(upload.parse_host_info(output), expected)
+
+    def test_invalid_targets_fail_before_remote_commands(self):
         for name in ("../escape", "-option", "node;touch /tmp/unwanted", "node[1-2]"):
             with patch.object(upload, "read_slurm_nodes", return_value=[{"name": name}]), \
                     patch.object(upload.subprocess, "run") as run, self.assertRaises(ValueError):
                 upload.discover_cluster_map()
             run.assert_not_called()
+
+    def test_525_node_regression_preserves_four_unreachable_hosts(self):
+        failed = {"V33-1698", "V33-6886", "V33-242", "V33-330"}
+        names = [f"node{i}" for i in range(521)] + sorted(failed)
+        def run(command, **kwargs):
+            outdir = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--outdir=")))
+            outdir.mkdir()
+            for i, name in enumerate(names[:521]):
+                (outdir / name).write_text(host_output(f"SERIAL{i}", f"ocid1.instance.test.unique{i}"))
+            return subprocess.CompletedProcess(command, 255)
+        with patch.object(upload, "read_slurm_nodes", return_value=[{"name": name} for name in names]), \
+                patch.object(upload.shutil, "which", return_value="/fake/clush"), \
+                patch.object(upload.subprocess, "run", side_effect=run), redirect_stderr(StringIO()):
+            data = upload.discover_cluster_map()
+        self.assertEqual(len(data["host_info"]), 525)
+        for name in failed:
+            self.assertEqual(data["host_info"][name], {"serial": "N/A", "ocid": "N/A"})
+        self.assertEqual(data["host_info"]["node520"]["serial"], "SERIAL520")
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in ("json", "csv"):
+                path = Path(directory) / ("map." + suffix)
+                upload.write_cluster_map(path, data)
+                loaded = upload.read_cluster_map(path)
+                self.assertEqual(loaded["host_info"], data["host_info"])
+                _, body = upload.prepare_upload(upload.read_json(ROOT / "config.example.json"), loaded, "cluster_map")
+                self.assertEqual(len(json.loads(body)["data"]["host_info"]), 525)
+
+    def test_clush_timeout_preserves_completed_fields(self):
+        def run(command, **kwargs):
+            outdir = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--outdir=")))
+            outdir.mkdir()
+            (outdir / "node001").write_text("BUCKET_MAP_SERIAL=S1\n")
+            raise subprocess.TimeoutExpired(command, 30)
+        with patch.object(upload, "read_slurm_nodes", return_value=self.nodes), \
+                patch.object(upload.shutil, "which", return_value="/fake/clush"), \
+                patch.object(upload.subprocess, "run", side_effect=run), redirect_stderr(StringIO()):
+            data = upload.discover_cluster_map()
+        self.assertEqual(data["host_info"]["node001"], {"serial": "S1", "ocid": "N/A"})
+        self.assertEqual(data["host_info"]["node002"], {"serial": "N/A", "ocid": "N/A"})
+
+    def test_ssh_timeout_preserves_partial_output(self):
+        error = subprocess.TimeoutExpired("ssh", 40, output=b"BUCKET_MAP_SERIAL=S1\n")
+        with patch.object(upload, "read_slurm_nodes", return_value=self.nodes[:1]), \
+                patch.object(upload.shutil, "which", side_effect=lambda name: None if name == "clush" else "/fake/ssh"), \
+                patch.object(upload.subprocess, "run", side_effect=error), redirect_stderr(StringIO()):
+            data = upload.discover_cluster_map()
+        self.assertEqual(data["host_info"]["node001"], {"serial": "S1", "ocid": "N/A"})
+
+    def test_partial_map_uses_distinct_node_names_in_slurm_view(self):
+        data = {"host_info": {"node001": {"serial": "S1", "ocid": "N/A"},
+                              "node002": {"serial": "N/A", "ocid": "N/A"},
+                              "node003": {"serial": "N/A", "ocid": "N/A"}}}
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in ("json", "csv"):
+                path = Path(directory) / ("map." + suffix)
+                upload.write_cluster_map(path, data)
+                nodes = self.nodes + [{"name": "node003", "state": ["DOWN"]}]
+                with patch.object(upload, "read_slurm_nodes", return_value=nodes):
+                    view = upload.discover_slurm(upload.read_node_map(path))
+                self.assertEqual(view["healthy_nodes"], ["S1"])
+                self.assertEqual(set(view["unhealthy_nodes"]), {"node002", "node003"})
+                self.assertEqual(view["missing_serial_nodes"], ["node002", "node003"])
+                self.assertEqual(view["node_identifier"], "host_serial_or_slurm_node_name")
 
     def test_upload_cli_normalizes_csv(self):
         with patch.object(upload, "upload") as send, redirect_stdout(StringIO()):

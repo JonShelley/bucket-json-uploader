@@ -229,6 +229,10 @@ def discover_slurm(node_map=None):
                 raise ValueError(f"node map is missing an entry for {name}")
             identifier = entry.get("host_serial")
             nonempty_string(identifier, f"host_serial for {name}")
+            if identifier == "N/A":
+                identifier = name
+                data["node_identifier"] = "host_serial_or_slurm_node_name"
+                data.setdefault("missing_serial_nodes", []).append(name)
             if "rack_id" in entry:
                 rack_id = entry["rack_id"]
                 nonempty_string(rack_id, f"rack_id for {name}")
@@ -271,10 +275,12 @@ def validate_cluster_map(data):
             nonempty_string(info.get(key), key)
             if any(c.isspace() for c in info[key]) or "," in info[key]:
                 raise ValueError(f"{key} must not contain whitespace or commas")
-        if info["serial"] in serials or info["ocid"] in ocids:
-            raise ValueError("host serials and OCIDs must be unique within a cluster map")
-        serials.add(info["serial"])
-        ocids.add(info["ocid"])
+        for key, seen in (("serial", serials), ("ocid", ocids)):
+            if info[key] == "N/A":
+                continue
+            if info[key] in seen:
+                raise ValueError("known host serials and OCIDs must be unique within a cluster map")
+            seen.add(info[key])
         if "rack_id" in info:
             nonempty_string(info["rack_id"], "rack_id")
 
@@ -318,23 +324,30 @@ def read_node_map(path):
 # The fixed command runs on each target, never on the collecting login node.
 HOST_INFO_COMMAND = (
     "set -eu; "
-    "serial=$(sudo -n dmidecode -s system-serial-number); "
+    "serial=$(sudo -n dmidecode -s system-serial-number) || serial=N/A; "
+    "printf 'BUCKET_MAP_SERIAL=%s\\n' \"$serial\"; "
     "ocid=$(curl -fsS --connect-timeout 5 --max-time 10 --noproxy 169.254.169.254 "
-    "-H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id); "
-    "printf 'BUCKET_MAP_SERIAL=%s\\nBUCKET_MAP_OCID=%s\\n' \"$serial\" \"$ocid\""
+    "-H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id) || ocid=N/A; "
+    "printf 'BUCKET_MAP_OCID=%s\\n' \"$ocid\""
 )
 
 
 def parse_host_info(output):
-    lines = output.splitlines()
-    if len(lines) != 2 or not lines[0].startswith("BUCKET_MAP_SERIAL=") or not lines[1].startswith("BUCKET_MAP_OCID="):
-        raise ValueError("unexpected host command output")
-    info = {"serial": lines[0].split("=", 1)[1].strip(), "ocid": lines[1].split("=", 1)[1].strip()}
-    if not info["ocid"].startswith("ocid1.instance.") or not info["ocid"].split(".")[-1]:
-        raise ValueError("IMDS did not return an instance OCID")
-    if info["serial"].lower() in {"none", "unknown", "not specified", "to be filled by o.e.m."}:
-        raise ValueError("dmidecode did not return a usable serial")
-    validate_cluster_map({"host_info": {"host": info}})
+    # A timeout can leave only one completed query in the captured output.
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    pieces = re.split(r"(?m)^BUCKET_MAP_(SERIAL|OCID)=", output)
+    info = {}
+    for key in ("serial", "ocid"):
+        values = [pieces[i + 1].strip() for i in range(1, len(pieces), 2)
+                  if pieces[i] == key.upper()]
+        value = values[0] if len(values) == 1 else ""
+        valid = bool(value) and not any(c.isspace() for c in value) and "," not in value
+        if key == "ocid":
+            valid = valid and value.startswith("ocid1.instance.") and bool(value.split(".")[-1])
+        else:
+            valid = valid and value.lower() not in {"none", "unknown", "not specified", "to be filled by o.e.m."}
+        info[key] = value if valid else "N/A"
     return info
 
 
@@ -342,7 +355,7 @@ def discover_cluster_map():
     names = [node["name"] for node in read_slurm_nodes()]
     if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) for name in names):
         raise ValueError("Slurm node names must be individual SSH host names (letters, digits, dots, underscores, dashes)")
-    hosts, failed = {}, []
+    hosts = {}
     clush = shutil.which("clush")
     if clush:
         print(f"Collecting {len(names)} hosts with clush (fanout 32)", file=sys.stderr)
@@ -354,20 +367,22 @@ def discover_cluster_map():
             command = [clush, "--nostdin", "-S", "-R", "ssh", "-f", "32", "-t", "10", "-u", "30",
                        "-o", "-oBatchMode=yes", f"--hostfile={hostfile}",
                        f"--outdir={outdir}", f"--errdir={folder / 'stderr'}", HOST_INFO_COMMAND]
+            result = None
             try:
                 result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                         text=True, timeout=((len(names) + 31) // 32) * 45 + 30)
             except subprocess.TimeoutExpired:
-                raise ValueError("clush collection timed out; no cluster map was saved") from None
+                print("Warning: clush timed out; preserving available results and using N/A for missing fields", file=sys.stderr)
             except (OSError, UnicodeError):
                 raise ValueError("could not execute clush; check the ClusterShell installation") from None
             for name in names:
                 try:
-                    hosts[name] = parse_host_info((outdir / name).read_text())
-                except (OSError, UnicodeError, ValueError):
-                    failed.append(name)
-            if result.returncode and not failed:
-                raise ValueError("clush reported remote command failure; no cluster map was saved")
+                    output = (outdir / name).read_text()
+                except (OSError, UnicodeError):
+                    output = ""
+                hosts[name] = parse_host_info(output)
+            if result is not None and result.returncode:
+                print("Warning: clush reported failures; available host results were retained", file=sys.stderr)
     else:
         ssh = shutil.which("ssh")
         if not ssh:
@@ -377,12 +392,16 @@ def discover_cluster_map():
             try:
                 result = subprocess.run([ssh, "-n", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                          name, HOST_INFO_COMMAND], capture_output=True, text=True, check=True, timeout=40)
-                hosts[name] = parse_host_info(result.stdout)
-            except (OSError, UnicodeError, subprocess.SubprocessError, ValueError):
-                failed.append(name)
-    if failed:
-        raise ValueError("could not collect serial/OCID for: " + ", ".join(failed) +
-                         "; check SSH, noninteractive sudo for dmidecode, and IMDS access; no map saved")
+                output = result.stdout
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                output = error.stdout or ""
+            except (OSError, UnicodeError):
+                output = ""
+            hosts[name] = parse_host_info(output)
+    missing = [f"{name} ({', '.join(key for key in ('serial', 'ocid') if info[key] == 'N/A')})"
+               for name, info in hosts.items() if "N/A" in info.values()]
+    if missing:
+        print(f"Warning: N/A fields for {len(missing)} hosts: " + ", ".join(missing), file=sys.stderr)
     data = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
             "host_info": hosts}
     validate_cluster_map(data)

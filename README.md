@@ -74,8 +74,9 @@ node002,HOST002,ocid1.instance.oc1.example.unique002
 ```
 
 The header also accepts spaces, such as `host name,host serial,host ocid`, and
-ignores capitalization. Every entry must provide all three values. Duplicate
-host names, serials, or OCIDs are rejected. JSON may additionally include a
+ignores capitalization. Every entry must provide all three fields. Use the
+literal string `"N/A"` for an unavailable serial or OCID. Repeated `N/A` values
+are allowed; duplicate host names or duplicate known serials/OCIDs are rejected. JSON may additionally include a
 `rack_id` inside each host entry for use with Slurm view discovery.
 
 To collect the map automatically from the Slurm cluster:
@@ -117,9 +118,18 @@ Each node needs `curl`, `dmidecode`, IMDS access, and sudo rights that allow
 `sudo -n dmidecode -s system-serial-number` without a password prompt. The `-n`
 option ensures a missing permission fails rather than hanging collection.
 Collection includes all nodes returned by Slurm, including down/FUTURE nodes;
-unreachable hosts will fail collection. Failed or malformed responses are
-reported by host name, and no partial map is saved. Existing output files are
-never overwritten. Correct access/connectivity and rerun with a fresh path.
+every returned host is kept in the map even if it cannot be reached. Failed,
+missing, or malformed serial/OCID values become `"N/A"` independently, so a
+successful serial query is preserved when IMDS fails and vice versa. An
+unreachable host is saved as `{"serial": "N/A", "ocid": "N/A"}`. Timeouts also
+preserve results collected so far. Collection prints a warning naming hosts and
+missing fields, then saves the JSON or CSV and exits successfully (code 0), even
+if every host has unavailable values. Such maps can be uploaded normally.
+
+Failure to obtain the Slurm inventory, invalid node names, unavailable local
+tools, duplicate known identities, or a file-write error still fails the command.
+Existing output files are never overwritten. After correcting connectivity,
+rerun with a fresh output path to refresh the map.
 
 See [ClusterShell output collection](https://clustershell.readthedocs.io/en/stable/tools/clush.html#saving-output-in-files)
 and [OCI instance metadata](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/gettingmetadata.htm).
@@ -183,12 +193,17 @@ each exact Slurm NodeName:
 }
 ```
 
-The map must cover every discovered node with a unique `host_serial`. When used,
-`node_identifier` becomes `host_serial`. Include `rack_id` for all nodes to
+The map must cover every discovered node. Known serials must be unique. When
+all serials are known, `node_identifier` becomes `host_serial`. For any `N/A`
+serial, Slurm view discovery uses that node's Slurm name, records the name in
+`missing_serial_nodes`, and sets `node_identifier` to
+`host_serial_or_slurm_node_name`. Missing OCIDs do not affect health discovery.
+This keeps inaccessible nodes distinct instead of using `N/A` as an identity.
+Include `rack_id` for all nodes to
 generate rack totals, healthy counts, comma-separated unhealthy serials, and
 `racks_with_16_plus_healthy_cts`. Omit `rack_id` from every entry for clusters
-without rack grouping. Partial serial or rack mappings are rejected so the
-snapshot cannot silently mix identities or undercount racks. Additional map
+without rack grouping. Missing node entries or partial rack mappings are rejected so the
+snapshot cannot silently drop nodes or undercount racks. Additional map
 entries for nodes not returned by Slurm are ignored. Rack IDs are supplied by
 the customer; network switches and hostname prefixes are not assumed to be racks.
 
