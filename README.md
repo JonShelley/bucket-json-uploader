@@ -60,16 +60,51 @@ Cluster view fields:
 | `observed_at` | Optional original snapshot-time field, used if `timestamp` is absent |
 | `total_nodes` | Nonnegative integer, total cluster inventory |
 | `offline_nodes` | Nonnegative integer count, no greater than total nodes |
-| `racks` | Array of objects with `rack_id` (unique string) and `healthy_cts` (nonnegative integer) |
+| `racks` | Optional object keyed by rack ID; each value contains `total_nodes`, `healthy`, and `unhealthy` |
 | `healthy_nodes` | Array of unique healthy host serial strings |
-| `unhealthy_nodes` | Array of unique unhealthy host serial strings |
-| `racks_with_16_plus_healthy_cts` | Optional; calculated from `racks`. If supplied, it must match. |
+| `unhealthy_nodes` | Object mapping each unhealthy host serial to a nonempty reason string; `{}` if none |
+| `racks_with_16_plus_healthy_cts` | Calculated from rack `healthy` counts when `racks` is present; if supplied alongside racks, it must match. Without racks it is optional and not inferred. |
 
-Healthy and unhealthy lists must not overlap or together exceed `total_nodes`.
-They may be partial. Offline is an independently supplied count; this MVP does
-not infer it from unhealthy nodes. Healthy CT counts are supplied separately
-from node counts; the script does not assume a CT-to-node mapping or discover
-health itself. The customer supplies their health classification.
+Example rack details and unhealthy host reasons:
+
+```json
+{
+  "racks": {
+    "rack-01": {
+      "total_nodes": 18,
+      "healthy": 16,
+      "unhealthy": "HOST017,HOST018"
+    }
+  },
+  "unhealthy_nodes": {
+    "HOST017": "Offline; host unreachable",
+    "HOST018": "RDMA link failure"
+  }
+}
+```
+
+The example above shows only the changed fields; see `examples/cluster_view.json`
+for a complete payload. For clusters where rack grouping does not apply, omit
+`racks` entirely, as in `examples/cluster_view_no_racks.json`. An empty rack
+object is also accepted and produces a qualifying rack count of zero. Omitted
+racks do not cause the uploader to add a rack summary.
+
+Rack `total_nodes` and `healthy` are nonnegative integers. Rack `unhealthy` is a
+comma-separated string of unique host serials, or `""` when none are unhealthy;
+spaces around serials are allowed. Healthy count plus listed unhealthy hosts
+cannot exceed the rack total. Combined rack totals cannot exceed the cluster
+total. Rack entries and node lists may be partial, so exact equality is not
+required and rack serials are not required to appear in the cluster mapping.
+
+Healthy host serials and keys in `unhealthy_nodes` must not overlap or together
+exceed `total_nodes`. Offline remains an independently supplied count. The
+customer supplies health classifications and reasons. Rack `healthy` is used
+for the existing `racks_with_16_plus_healthy_cts` summary; the uploader does not
+discover health or perform a separate CT-to-node conversion.
+
+This payload format uses envelope `schema_version: 2`. Previous array-based
+`racks` and `unhealthy_nodes` inputs must be updated to the objects shown above.
+Existing objects in the bucket are unchanged.
 
 Job failure fields:
 
@@ -105,7 +140,7 @@ The uploaded document wraps the input with identifying metadata:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "customer_id": "customer-a",
   "cluster_id": "cluster-01",
   "data_type": "job_data",

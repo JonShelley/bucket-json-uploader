@@ -27,7 +27,7 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(name, "customer-a/cluster-01/view/261111:15:00:00.json")
         self.assertEqual(document["data"]["racks_with_16_plus_healthy_cts"], 1)
         self.assertEqual(document["customer_id"], "customer-a")
-        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["schema_version"], 2)
         self.assertNotIn("par_url", document)
         self.assertEqual(document["data"]["timestamp"], "2026-11-11T15:00:00.000000Z")
 
@@ -72,16 +72,71 @@ class UploadTests(unittest.TestCase):
 
     def test_invalid_cluster_data(self):
         cases = [
-            {"offline_nodes": 5}, {"total_nodes": True},
-            {"healthy_nodes": ["HOST003"]}, {"unhealthy_nodes": ["X", "X"]},
-            {"racks": [{"rack_id": "a", "healthy_cts": -1}]},
+            {"offline_nodes": 19}, {"total_nodes": True},
+            {"healthy_nodes": ["HOST017"]}, {"unhealthy_nodes": ["HOST017"]},
+            {"unhealthy_nodes": {"HOST017": ""}},
+            {"unhealthy_nodes": {"": "Offline"}},
+            {"unhealthy_nodes": {"HOST017": None}},
+            {"unhealthy_nodes": {"HOST017": {"reason": "Offline"}}},
             {"racks_with_16_plus_healthy_cts": 0},
             {"observed_at": "2026-11-11T15:00:00"},
-            {"racks": [{"rack_id": "a", "healthy_cts": 16}] * 2},
+            {"total_nodes": 1, "racks": {}},
         ]
         for change in cases:
             with self.subTest(change=change), self.assertRaises(ValueError):
                 upload.validate_data({**copy.deepcopy(self.cluster), **change}, "cluster_view")
+
+    def test_racks_are_optional(self):
+        data = upload.read_json(ROOT / "examples/cluster_view_no_racks.json")
+        _, body = upload.prepare_upload(self.config, data, "cluster_view")
+        stored = json.loads(body)["data"]
+        self.assertNotIn("racks", stored)
+        self.assertNotIn("racks_with_16_plus_healthy_cts", stored)
+        self.assertEqual(stored["unhealthy_nodes"], {"HOST002": "Offline; host unreachable"})
+
+    def test_empty_racks_and_unhealthy_nodes_are_valid(self):
+        self.cluster.update(racks={}, unhealthy_nodes={})
+        upload.validate_data(self.cluster, "cluster_view")
+        self.assertEqual(self.cluster["racks_with_16_plus_healthy_cts"], 0)
+
+    def test_rack_details_are_preserved_and_summary_counts_threshold(self):
+        racks = {
+            "rack-01": {"total_nodes": 18, "healthy": 16, "unhealthy": "HOST017, HOST018"},
+            "rack-02": {"total_nodes": 16, "healthy": 15, "unhealthy": "HOST034"},
+            "rack-03": {"total_nodes": 17, "healthy": 17, "unhealthy": ""},
+        }
+        self.cluster.update(total_nodes=51, racks=copy.deepcopy(racks))
+        _, body = upload.prepare_upload(self.config, self.cluster, "cluster_view")
+        stored = json.loads(body)["data"]
+        self.assertEqual(stored["racks"], racks)
+        self.assertEqual(stored["racks_with_16_plus_healthy_cts"], 2)
+        self.assertEqual(stored["unhealthy_nodes"]["HOST018"], "RDMA link failure")
+
+    def test_invalid_rack_details(self):
+        for racks in (
+            [], None, {"": {}}, {"rack-01": []},
+            {"rack-01": {"total_nodes": 18, "healthy": 16}},
+            {"rack-01": {"total_nodes": 18, "healthy": 19, "unhealthy": ""}},
+            {"rack-01": {"total_nodes": -1, "healthy": 0, "unhealthy": ""}},
+            {"rack-01": {"total_nodes": 18, "healthy": True, "unhealthy": ""}},
+            {"rack-01": {"total_nodes": 18, "healthy": 16, "unhealthy": ["A"]}},
+            {"rack-01": {"total_nodes": 18, "healthy": 16, "unhealthy": "A,A"}},
+            {"rack-01": {"total_nodes": 18, "healthy": 16, "unhealthy": "A,"}},
+            {"rack-01": {"total_nodes": 18, "healthy": 16, "unhealthy": " "}},
+            {"rack-01": {"total_nodes": 18, "healthy": 17, "unhealthy": "A,B"}},
+            {"rack-01": {"total_nodes": 19, "healthy": 16, "unhealthy": ""}},
+        ):
+            with self.subTest(racks=racks), self.assertRaises(ValueError):
+                upload.validate_data({**copy.deepcopy(self.cluster), "racks": racks}, "cluster_view")
+
+    def test_summary_without_racks_is_validated_but_not_inferred(self):
+        self.cluster.pop("racks")
+        self.cluster["racks_with_16_plus_healthy_cts"] = 1
+        upload.validate_data(self.cluster, "cluster_view")
+        self.assertEqual(self.cluster["racks_with_16_plus_healthy_cts"], 1)
+        self.cluster["racks_with_16_plus_healthy_cts"] = -1
+        with self.assertRaises(ValueError):
+            upload.validate_data(self.cluster, "cluster_view")
 
     def test_invalid_job_data(self):
         for change in ({"time": "yesterday"}, {"host_serials": []}, {"reason": ""}):

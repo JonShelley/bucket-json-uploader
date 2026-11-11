@@ -109,30 +109,44 @@ def validate_data(data, kind):
         count(data.get(key), key)
     if data["offline_nodes"] > data["total_nodes"]:
         raise ValueError("offline_nodes cannot exceed total_nodes")
-    for key in ("healthy_nodes", "unhealthy_nodes"):
-        string_list(data.get(key), key)
-    if set(data["healthy_nodes"]) & set(data["unhealthy_nodes"]):
+    string_list(data.get("healthy_nodes"), "healthy_nodes")
+    unhealthy = data.get("unhealthy_nodes")
+    if not isinstance(unhealthy, dict):
+        raise ValueError("unhealthy_nodes must be an object mapping host serials to reasons")
+    for serial, reason in unhealthy.items():
+        nonempty_string(serial, "unhealthy_nodes host serial")
+        nonempty_string(reason, "unhealthy_nodes reason")
+    if set(data["healthy_nodes"]) & set(unhealthy):
         raise ValueError("healthy_nodes and unhealthy_nodes must not overlap")
-    if len(data["healthy_nodes"]) + len(data["unhealthy_nodes"]) > data["total_nodes"]:
+    if len(data["healthy_nodes"]) + len(unhealthy) > data["total_nodes"]:
         raise ValueError("node lists cannot contain more nodes than total_nodes")
-    racks = data.get("racks")
-    if not isinstance(racks, list):
-        raise ValueError("racks must be a list of objects with rack_id and healthy_cts")
-    ids = []
-    for rack in racks:
+    summary_key = "racks_with_16_plus_healthy_cts"
+    if summary_key in data:
+        count(data[summary_key], summary_key)
+    if "racks" not in data:
+        return
+    racks = data["racks"]
+    if not isinstance(racks, dict):
+        raise ValueError("racks must be an object keyed by rack ID")
+    for rack_id, rack in racks.items():
+        nonempty_string(rack_id, "rack ID")
         if not isinstance(rack, dict):
             raise ValueError("each rack must be an object")
-        nonempty_string(rack.get("rack_id"), "rack_id")
-        count(rack.get("healthy_cts"), "healthy_cts")
-        ids.append(rack["rack_id"])
-    if len(ids) != len(set(ids)):
-        raise ValueError("rack_id values must be unique")
-    qualifying = sum(rack["healthy_cts"] >= 16 for rack in racks)
-    if "racks_with_16_plus_healthy_cts" in data:
-        count(data["racks_with_16_plus_healthy_cts"], "racks_with_16_plus_healthy_cts")
-        if data["racks_with_16_plus_healthy_cts"] != qualifying:
-            raise ValueError("racks_with_16_plus_healthy_cts does not match the rack list")
-    data["racks_with_16_plus_healthy_cts"] = qualifying
+        for key in ("total_nodes", "healthy"):
+            count(rack.get(key), f"rack {rack_id} {key}")
+        serials = rack.get("unhealthy")
+        if not isinstance(serials, str):
+            raise ValueError("rack unhealthy must be a comma-separated string of host serials (empty if none)")
+        hosts = [serial.strip() for serial in serials.split(",")] if serials else []
+        string_list(hosts, f"rack {rack_id} unhealthy serials")
+        if rack["healthy"] + len(hosts) > rack["total_nodes"]:
+            raise ValueError(f"rack {rack_id} healthy and unhealthy counts cannot exceed total_nodes")
+    if sum(rack["total_nodes"] for rack in racks.values()) > data["total_nodes"]:
+        raise ValueError("rack totals cannot exceed cluster total_nodes")
+    qualifying = sum(rack["healthy"] >= 16 for rack in racks.values())
+    if summary_key in data and data[summary_key] != qualifying:
+        raise ValueError("racks_with_16_plus_healthy_cts does not match the rack details")
+    data[summary_key] = qualifying
 
 
 def prepare_upload(config, data, kind):
@@ -153,7 +167,7 @@ def prepare_upload(config, data, kind):
                                    else "%y%m%d:%H:%M:%S.%f")
     object_name = f"{config['customer_id']}/{config['cluster_id']}/{directory}/{filename}.json"
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "customer_id": config["customer_id"],
         "cluster_id": config["cluster_id"],
         "data_type": kind,

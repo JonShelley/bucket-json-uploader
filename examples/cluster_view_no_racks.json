@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-11-11T15:00:00Z",
+  "total_nodes": 2,
+  "offline_nodes": 1,
+  "healthy_nodes": [
+    "HOST001"
+  ],
+  "unhealthy_nodes": {
+    "HOST002": "Offline; host unreachable"
+  }
+}

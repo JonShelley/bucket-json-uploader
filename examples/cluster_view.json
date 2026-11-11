@@ -1,11 +1,34 @@
 {
   "timestamp": "2026-11-11T15:00:00Z",
-  "total_nodes": 4,
+  "total_nodes": 18,
   "offline_nodes": 1,
-  "racks": [
-    {"rack_id": "rack-01", "healthy_cts": 16},
-    {"rack_id": "rack-02", "healthy_cts": 12}
+  "racks": {
+    "rack-01": {
+      "total_nodes": 18,
+      "healthy": 16,
+      "unhealthy": "HOST017,HOST018"
+    }
+  },
+  "healthy_nodes": [
+    "HOST001",
+    "HOST002",
+    "HOST003",
+    "HOST004",
+    "HOST005",
+    "HOST006",
+    "HOST007",
+    "HOST008",
+    "HOST009",
+    "HOST010",
+    "HOST011",
+    "HOST012",
+    "HOST013",
+    "HOST014",
+    "HOST015",
+    "HOST016"
   ],
-  "healthy_nodes": ["HOST001", "HOST002"],
-  "unhealthy_nodes": ["HOST003", "HOST004"]
+  "unhealthy_nodes": {
+    "HOST017": "Offline; host unreachable",
+    "HOST018": "RDMA link failure"
+  }
 }
